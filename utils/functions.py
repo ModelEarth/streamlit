@@ -85,13 +85,13 @@ def evaluate(y_test, y_pred, y_pred_prob):
     col1, col2 = st.columns(2)
 
     with col1:
-        st.write(f"**ROC-AUC Score** \t\t: {roc_auc*100} %")
-        st.write('**Best Threshold** \t\t: %.3f' % (thresholds[ix]))
+        st.write(f"*ROC-AUC Score* \t\t: {roc_auc*100} %")
+        st.write('*Best Threshold* \t\t: %.3f' % (thresholds[ix]))
     with col2:
-        st.write('**G-Mean** \t\t\t: %.3f' % (gmeans[ix]))
-        st.write(f"**Model Accuracy** : {round(accuracy,2,)*100} %")
+        st.write('*G-Mean* \t\t\t: %.3f' % (gmeans[ix]))
+        st.write(f"*Model Accuracy* : {round(accuracy,2,)*100} %")
 
-    st.write("**Classification Report:**")
+    st.write("*Classification Report:*")
     st.text(classification_report(y_test, y_pred))
 
 
@@ -125,7 +125,7 @@ def trainer(df, test_size, over_sample, vectorizer, model):
     report_base64 = base64.b64encode(report_bytes).decode('utf-8')
 
     #Generate the name of the file
-    model_name = str(model.__class__.__name__)
+    model_name = str(model._class.name_)
     random_int = random.randint(1, 1000000)
 
     #defne the repo route
@@ -226,6 +226,74 @@ def get_approved_choices():
     return APPROVED_NOTEBOOK_CHOICES
 
 
+def detect_cpu_only():
+    """
+    Detect if the system has GPU/CUDA support.
+    Returns True if CPU-only mode should be used.
+    """
+    try:
+        import subprocess
+        # Try to detect NVIDIA GPU
+        result = subprocess.run(['nvidia-smi'], capture_output=True, timeout=5)
+        return result.returncode != 0  # True if nvidia-smi fails (no GPU)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return True  # No nvidia-smi found, assume CPU-only
+
+
+def prepare_notebook_for_cpu(notebook_content):
+    """
+    Modify notebook to skip GPU-intensive cells when running on CPU.
+    Adds a parameter cell and conditional logic.
+    """
+    import json
+
+    nb = json.loads(notebook_content)
+
+    # Add a parameter cell at the beginning (after cell 0)
+    parameter_cell = {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {
+            "tags": ["parameters"]
+        },
+        "outputs": [],
+        "source": [
+            "# Papermill parameters - DO NOT EDIT MANUALLY\n",
+            "use_cpu = False  # Will be set to True for CPU-only execution\n",
+            "model_type = 'lr'  # Model to run\n",
+            "test_size = 0.3\n",
+            "max_features = 500\n",
+            "random_state = 42\n",
+            "oversample = True\n"
+        ]
+    }
+
+    # Insert parameter cell after the first cell (index 1)
+    if len(nb['cells']) > 1:
+        nb['cells'].insert(1, parameter_cell)
+
+    # Add CPU check cell after parameter cell
+    cpu_check_cell = {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# Skip GPU setup if use_cpu is True\n",
+            "import sys\n",
+            "if use_cpu:\n",
+            "    print('⚠️ Running in CPU-only mode. GPU cells will be skipped.')\n",
+            "    print('⚠️ This notebook requires GPU for full functionality.')\n",
+            "    print('⚠️ Some features may not work correctly in CPU mode.')\n",
+            "    sys.exit(0)  # Exit early to prevent RAPIDS installation\n"
+        ]
+    }
+
+    nb['cells'].insert(2, cpu_check_cell)
+
+    return json.dumps(nb)
+
+
 def run_notebook_from_github(
     notebook_name,
     parameters=None,
@@ -235,6 +303,7 @@ def run_notebook_from_github(
 ):
     """
     Download and execute a Jupyter notebook from GitHub using papermill.
+    Automatically detects CPU-only systems and provides appropriate error messages.
     """
 
     # Security check
@@ -242,6 +311,19 @@ def run_notebook_from_github(
         error_msg = f"Notebook '{notebook_name}' not in approved list"
         st.error(error_msg)
         return False, None, error_msg
+
+    # Detect if CPU-only mode is needed
+    use_cpu = detect_cpu_only()
+    if use_cpu:
+        st.warning(
+            "⚠️ *CPU-only system detected*\n\n"
+            "This notebook requires GPU/CUDA support which is not available. "
+            "The execution will fail at the RAPIDS installation step.\n\n"
+            "*Recommended actions:*\n"
+            "- Run the notebook in Google Colab with GPU runtime (T4 GPU)\n"
+            "- Use a cloud instance with NVIDIA GPU support\n"
+            "- Wait for a CPU-compatible version of the models"
+        )
 
     temp_input_path, temp_output_path = None, None
 
@@ -262,12 +344,34 @@ def run_notebook_from_github(
 
         file_data = response.json()
 
+        # Handle different encoding types from GitHub API
         if file_data.get("encoding") == "base64":
             notebook_content = base64.b64decode(file_data["content"]).decode("utf-8")
+        elif file_data.get("encoding") == "none":
+            # For large files (>1MB), GitHub returns encoding="none" and provides download_url
+            download_url = file_data.get("download_url")
+            if not download_url:
+                error_msg = "No download URL provided for large notebook file"
+                st.error(error_msg)
+                return False, None, error_msg
+
+            st.info(f"Downloading large notebook from raw URL...")
+            download_response = requests.get(download_url, timeout=60)
+            if download_response.status_code != 200:
+                error_msg = f"Failed to download notebook: HTTP {download_response.status_code}"
+                st.error(error_msg)
+                return False, None, error_msg
+
+            notebook_content = download_response.text
         else:
-            error_msg = "Notebook content encoding not supported"
+            error_msg = f"Notebook content encoding '{file_data.get('encoding')}' not supported"
             st.error(error_msg)
             return False, None, error_msg
+
+        # Prepare notebook for CPU execution if needed
+        if use_cpu:
+            st.info("Preparing notebook for CPU-only execution...")
+            notebook_content = prepare_notebook_for_cpu(notebook_content)
 
         # Create temporary files
         with tempfile.NamedTemporaryFile(mode="w", suffix=".ipynb", delete=False) as temp_input:
@@ -276,19 +380,42 @@ def run_notebook_from_github(
 
         temp_output_path = temp_input_path.replace(".ipynb", "_output.ipynb")
 
+        # Merge use_cpu parameter with user parameters
+        exec_parameters = parameters or {}
+        exec_parameters['use_cpu'] = use_cpu
+
         st.info("Executing notebook with papermill...")
 
         # Execute notebook with papermill
         pm.execute_notebook(
             input_path=temp_input_path,
             output_path=temp_output_path,
-            parameters=parameters or {},
+            parameters=exec_parameters,
             progress_bar=False,
             log_output=True
         )
 
         st.success(f"Notebook '{notebook_name}' executed successfully!")
         return True, temp_output_path, None
+
+    except pm.PapermillExecutionError as e:
+        # Papermill execution errors with detailed info
+        error_msg = str(e)
+
+        # Check if it's a RAPIDS/CUDA/GPU related error
+        if any(keyword in error_msg.lower() for keyword in ['rapids', 'cuda', 'gpu', 'cudf', 'cuml', 'cupy']):
+            error_msg = (
+                "⚠️ GPU/RAPIDS execution error detected.\n\n"
+                "The notebook requires GPU support (RAPIDS/CUDA) which is not available on your system.\n\n"
+                "*Solutions:*\n"
+                "1. Run the notebook in Google Colab with GPU runtime\n"
+                "2. Use a cloud instance with NVIDIA GPU support\n"
+                "3. Wait for CPU-only version of the notebook (coming soon)\n\n"
+                f"Technical details: {str(e)[:500]}"
+            )
+
+        st.error(error_msg)
+        return False, temp_output_path, error_msg
 
     except Exception as e:
         error_msg = f"Unexpected error running notebook: {str(e)}"
@@ -319,7 +446,7 @@ def display_notebook_results(output_path):
 
         for i, cell in enumerate(notebook_data.get("cells", [])):
             if cell.get("cell_type") == "code" and cell.get("outputs"):
-                st.write(f"**Cell {i + 1}:**")
+                st.write(f"*Cell {i + 1}:*")
 
                 if cell.get("source"):
                     code = "".join(cell["source"])
