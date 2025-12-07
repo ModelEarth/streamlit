@@ -2,7 +2,14 @@ from utils.libraries import st
 from utils.explore_page import show_explore_page
 from utils.model_page import compare_model_page
 from utils.predict_page import show_predict_page
-from utils.functions import get_approved_choices, run_notebook_from_github, display_notebook_results
+from utils.functions import (
+    get_approved_choices, 
+    run_notebook_from_github, 
+    display_notebook_results,
+    detect_cpu_only,
+    is_model_gpu_required,
+    get_gpu_warning_message
+)
 
 import pandas as pd
 
@@ -55,7 +62,7 @@ st.write(f'<link type="text/css" rel="stylesheet" href="https://model.earth/loca
 features = st.sidebar.selectbox("Features", ("Local Industries", "Local Places", "Local Products", "Job Descriptions", "Brain Voxels"), index=3)
 targets = st.sidebar.selectbox("Target", ("Honey Bees", "Job Growth", "Wage Growth", "High Wages", "Real Job Listings", "Tree Canopy", "Eye Blinks"), index=4)
 
-GITHUB_RAW_URL = "https://raw.githubusercontent.com/ayushmunjial/reality.streamlit.large/main/input/jobs/fake_job_postings.csv"
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/ModelEarth/reality.streamlit.large/refs/heads/main/input/jobs/fake_job_postings.csv"
 
 if targets == "Real Job Listings":
     df_jobs = load_job_dataset_from_github(GITHUB_RAW_URL)
@@ -77,7 +84,15 @@ MODEL_CODE = {
 models = st.sidebar.selectbox("Model", list(MODEL_CODE.keys()), index=0)
 selected_code = MODEL_CODE[models]
 
+# Check system capabilities and show appropriate warning
+system_is_cpu_only = detect_cpu_only()
+warning_msg = get_gpu_warning_message(selected_code, system_is_cpu_only)
 
+if warning_msg:
+    if is_model_gpu_required(selected_code):
+        st.sidebar.error(warning_msg)
+    else:
+        st.sidebar.info(warning_msg)
 
 with st.spinner(f"Executing {models}..."):
     parameters = {

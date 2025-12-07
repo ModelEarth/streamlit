@@ -240,14 +240,75 @@ def detect_cpu_only():
         return True  # No nvidia-smi found, assume CPU-only
 
 
+# Model GPU requirements
+MODEL_GPU_REQUIREMENTS = {
+    "lr": False,           # Logistic Regression - CPU safe
+    "rfc": False,          # Random Forest Classifier - CPU safe
+    "rbf": False,          # Random Bits Forest - CPU safe
+    "svm": False,          # SVM - CPU safe (though slower)
+    "mlp": False,          # MLP - CPU safe (but slower)
+    "xgboost": False,      # XGBoost - CPU safe (GPU optional)
+    "rapids": True,        # RAPIDS - GPU required
+    "cuml": True,          # NVIDIA cuML - GPU required
+}
+
+
+def is_model_gpu_required(model_type):
+    """
+    Check if a specific model requires GPU support.
+    
+    Args:
+        model_type (str): The model code (e.g., 'xgboost', 'rapids', 'lr')
+    
+    Returns:
+        bool: True if GPU is required, False if CPU-safe
+    """
+    return MODEL_GPU_REQUIREMENTS.get(model_type.lower(), False)
+
+
+def get_gpu_warning_message(model_type, system_is_cpu_only):
+    """
+    Generate an appropriate warning message based on model and system.
+    
+    Args:
+        model_type (str): The model code
+        system_is_cpu_only (bool): Whether system is CPU-only
+    
+    Returns:
+        str or None: Warning message, or None if no warning needed
+    """
+    model_gpu_required = is_model_gpu_required(model_type)
+    
+    if system_is_cpu_only and model_gpu_required:
+        return (
+            f"⚠️ **GPU Required for {model_type.upper()}**\n\n"
+            f"This model requires NVIDIA GPU/CUDA support, which is not detected on your system.\n"
+            f"The notebook will likely fail at the GPU initialization step.\n\n"
+            "**Alternatives:**\n"
+            "- Try a CPU-safe model (Logistic Regression, Random Forest, SVM, XGBoost)\n"
+            "- Run in Google Colab with GPU runtime\n"
+            "- Use a cloud instance with NVIDIA GPU support"
+        )
+    elif system_is_cpu_only:
+        return (
+            f"ℹ️ **Running {model_type.upper()} in CPU-only mode**\n"
+            f"This model is CPU-compatible but may run slower than with GPU acceleration."
+        )
+    
+    return None
+
+
 def prepare_notebook_for_cpu(notebook_content):
     """
     Modify notebook to skip GPU-intensive cells when running on CPU.
-    Adds a parameter cell and conditional logic.
+    Adds a parameter cell and conditional logic, respects 'gpu-only' tags.
     """
     import json
 
     nb = json.loads(notebook_content)
+    
+    # Define GPU keywords to detect GPU-only cells
+    GPU_SKIP_KEYWORDS = ['rapids', 'cuml', 'cudf', 'cuda', 'gpu', 'nvml']
 
     # Add a parameter cell at the beginning (after cell 0)
     parameter_cell = {
@@ -279,17 +340,50 @@ def prepare_notebook_for_cpu(notebook_content):
         "metadata": {},
         "outputs": [],
         "source": [
-            "# Skip GPU setup if use_cpu is True\n",
+            "# CPU-only mode configuration\n",
             "import sys\n",
-            "if use_cpu:\n",
-            "    print('⚠️ Running in CPU-only mode. GPU cells will be skipped.')\n",
-            "    print('⚠️ This notebook requires GPU for full functionality.')\n",
-            "    print('⚠️ Some features may not work correctly in CPU mode.')\n",
-            "    sys.exit(0)  # Exit early to prevent RAPIDS installation\n"
+            "CPU_ONLY_MODE = use_cpu\n",
+            "\n",
+            "if CPU_ONLY_MODE:\n",
+            "    print('='*60)\n",
+            "    print('⚠️  RUNNING IN CPU-ONLY MODE')\n",
+            "    print('='*60)\n",
+            "    print('ℹ️  GPU/CUDA-dependent cells will be skipped')\n",
+            "    print('ℹ️  Using CPU-compatible algorithms')\n",
+            "    print('='*60)\n"
         ]
     }
 
     nb['cells'].insert(2, cpu_check_cell)
+
+    # Process all cells and wrap gpu-only cells with conditional checks
+    for cell in nb['cells'][3:]:  # Skip our added cells
+        if cell.get("cell_type") == "code":
+            # Check if cell has 'gpu-only' tag
+            tags = cell.get("metadata", {}).get("tags", [])
+            source = "".join(cell.get("source", []))
+            is_gpu_cell = "gpu-only" in tags or any(kw in source.lower() for kw in GPU_SKIP_KEYWORDS)
+            
+            if is_gpu_cell:
+                # Wrap the cell content with CPU check
+                new_source = [
+                    "# GPU-only cell - skipped in CPU mode\n",
+                    "if not CPU_ONLY_MODE:\n",
+                ]
+                
+                # Indent the original source code
+                original_lines = cell.get("source", [])
+                for line in original_lines:
+                    if line.strip():  # Non-empty lines
+                        new_source.append("    " + line if not line.startswith("    ") else line)
+                    else:
+                        new_source.append(line)
+                
+                cell["source"] = new_source
+                
+                # Add tag if not present
+                if "gpu-only" not in tags:
+                    cell["metadata"]["tags"] = tags + ["gpu-only"]
 
     return json.dumps(nb)
 
@@ -314,15 +408,33 @@ def run_notebook_from_github(
 
     # Detect if CPU-only mode is needed
     use_cpu = detect_cpu_only()
+    
+    # Check if selected model requires GPU
+    model_type = parameters.get("model_type", "lr") if parameters else "lr"
+    model_needs_gpu = is_model_gpu_required(model_type)
+    
+    if use_cpu and model_needs_gpu:
+        error_msg = (
+            f"⚠️ **Cannot run {model_type.upper()} on CPU-only system**\n\n"
+            "This model requires NVIDIA GPU/CUDA support which is not available.\n\n"
+            "**Solutions:**\n"
+            "1. **Google Colab** (Recommended) - Free GPU access with T4 GPU\n"
+            "2. **AWS/Azure** - Cloud instances with NVIDIA GPU\n"
+            "3. **Local GPU** - Install NVIDIA drivers and CUDA toolkit\n\n"
+            "**CPU-Safe Models:**\n"
+            "- ✅ Logistic Regression (lr)\n"
+            "- ✅ Random Forest Classifier (rfc)\n"
+            "- ✅ Support Vector Machines (svm)\n"
+            "- ✅ Neural Network MLP (mlp)\n"
+            "- ✅ XGBoost (xgboost)"
+        )
+        st.error(error_msg)
+        return False, None, error_msg
+    
     if use_cpu:
-        st.warning(
-            "⚠️ *CPU-only system detected*\n\n"
-            "This notebook requires GPU/CUDA support which is not available. "
-            "The execution will fail at the RAPIDS installation step.\n\n"
-            "*Recommended actions:*\n"
-            "- Run the notebook in Google Colab with GPU runtime (T4 GPU)\n"
-            "- Use a cloud instance with NVIDIA GPU support\n"
-            "- Wait for a CPU-compatible version of the models"
+        st.info(
+            "ℹ️ **CPU-only Mode**\n\n"
+            f"Running {model_type.upper()} in CPU mode. Execution may take longer than with GPU acceleration."
         )
 
     temp_input_path, temp_output_path = None, None
@@ -405,13 +517,13 @@ def run_notebook_from_github(
         # Check if it's a RAPIDS/CUDA/GPU related error
         if any(keyword in error_msg.lower() for keyword in ['rapids', 'cuda', 'gpu', 'cudf', 'cuml', 'cupy']):
             error_msg = (
-                "⚠️ GPU/RAPIDS execution error detected.\n\n"
+                "⚠️ **GPU/RAPIDS execution error detected**\n\n"
                 "The notebook requires GPU support (RAPIDS/CUDA) which is not available on your system.\n\n"
                 "*Solutions:*\n"
-                "1. Run the notebook in Google Colab with GPU runtime\n"
+                "1. Run the notebook in Google Colab with GPU runtime (T4 GPU)\n"
                 "2. Use a cloud instance with NVIDIA GPU support\n"
                 "3. Wait for CPU-only version of the notebook (coming soon)\n\n"
-                f"Technical details: {str(e)[:500]}"
+                f"*Technical details:* ```{str(e)[:500]}```"
             )
 
         st.error(error_msg)
